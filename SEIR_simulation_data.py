@@ -1,108 +1,170 @@
+import os
 import argparse
+import sys
+import time
 import torch
-import matplotlib.pyplot as plt
+import torchsde
 
-def seir_simulation(beta, sigma, gamma, initial_values, N, dt, T):
-    # Calculate the number of steps based on total time T and time step dt
-    num_steps = int(T / dt)
+# needed for torchsde
+sys.setrecursionlimit(1500)
 
-    # Unpack initial values
-    S, E, I, R = initial_values
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Initialize tensors for S, E, I, R
-    S = torch.tensor([S], dtype=torch.float32)
-    E = torch.tensor([E], dtype=torch.float32)
-    I = torch.tensor([I], dtype=torch.float32)
-    R = torch.tensor([R], dtype=torch.float32)
 
-    # Store the results over time
-    S_values, E_values, I_values, R_values = [], [], [], []
+class SEIR_SDE(torch.nn.Module):
+    noise_type = "general"
+    sde_type = "ito"
 
-    for _ in range(num_steps):
-        # Deterministic components of SEIR model
-        dS = (-beta * S * I / N) * dt
-        dE = (beta * S * I / N - sigma * E) * dt
-        dI = (sigma * E - gamma * I) * dt
-        dR = (gamma * I) * dt
+    def __init__(self, params, population_size):
+        super().__init__()
+        # parameters: (beta, sigma, gamma)
+        self.params = params
+        self.N = population_size
 
-        # Ensure the shapes are consistent
-        dS = dS.unsqueeze(-1)
-        dE = dE.unsqueeze(-1)
-        dI = dI.unsqueeze(-1)
-        dR = dR.unsqueeze(-1)
+    def f_and_g(self, t, x):
+        with torch.no_grad():
+            x.clamp_(0.0, self.N)
 
-        # Batch size handling (single batch in this case)
+        S, E, I = x.T  # Note: We stop tracking R explicitly
+        beta, sigma, gamma = self.params.T
+
+        # Drift (f_term)
+        f_term = torch.stack([
+            -beta * S * I / self.N,                    # dS/dt
+            beta * S * I / self.N - sigma * E,         # dE/dt
+            sigma * E - gamma * I                      # dI/dt
+        ], dim=-1)
+
+        # Diffusion (g_term)
         batch_size = S.shape[0]
 
-        # Initialize the diffusion terms for each component
-        g_S = torch.zeros(batch_size, 4)
-        g_S[:, 0] = -torch.sqrt(beta * S * I / N).squeeze(-1)  # g_SS component
+        g_S = torch.zeros(batch_size, 3)
+        g_S[:, 0] = -torch.sqrt(beta * S * I / self.N).squeeze(-1)
 
-        g_E = torch.zeros(batch_size, 4)
-        g_E[:, 0] = torch.sqrt(beta * S * I / N).squeeze(-1)  # g_ES component
-        g_E[:, 1] = -torch.sqrt(sigma * E).squeeze(-1)        # g_EE component
+        g_E = torch.zeros(batch_size, 3)
+        g_E[:, 0] = torch.sqrt(beta * S * I / self.N).squeeze(-1)
+        g_E[:, 1] = -torch.sqrt(sigma * E).squeeze(-1)
 
-        g_I = torch.zeros(batch_size, 4)
-        g_I[:, 1] = torch.sqrt(sigma * E).squeeze(-1)         # g_IE component
-        g_I[:, 2] = -torch.sqrt(gamma * I).squeeze(-1)        # g_II component
+        g_I = torch.zeros(batch_size, 3)
+        g_I[:, 1] = torch.sqrt(sigma * E).squeeze(-1)
+        g_I[:, 2] = -torch.sqrt(gamma * I).squeeze(-1)
 
-        g_R = torch.zeros(batch_size, 4)
-        g_R[:, 2] = torch.sqrt(gamma * I).squeeze(-1)         # g_RI component
+        # Stack all components together
+        g_term = torch.stack([g_S, g_E, g_I], dim=-1)  # (batch_size, 3, 3)
 
-        # Sample Wiener process increments (4, 1)
-        dW = torch.randn(4, 1) * torch.sqrt(torch.tensor(dt))
+        return f_term, g_term
 
-        # Apply the stochastic updates according to the SDEs
-        S = S + dS + (g_S @ dW).squeeze(-1)
-        E = E + dE + (g_E @ dW).squeeze(-1)
-        I = I + dI + (g_I @ dW).squeeze(-1)
-        R = R + dR + (g_R @ dW).squeeze(-1)
 
-        # Store results
-        S_values.append(S.item())
-        E_values.append(E.item())
-        I_values.append(I.item())
-        R_values.append(R.item())
+def solve_seir_sdes(
+    num_samples,
+    device,
+    grid=10000,
+    savegrad=False,
+    save=False,
+    filename="seir_sde_data.pt",
+    theta_loc=None,
+    theta_covmat=None,
+):
+    ####### Change priors here ######
+    if theta_loc is None or theta_covmat is None:
+        theta_loc = torch.tensor([0.3, 0.1, 0.1], device=device).log()
+        theta_covmat = torch.eye(3, device=device) * 0.5 ** 2
 
-    return S_values, E_values, I_values, R_values
+    prior = torch.distributions.MultivariateNormal(theta_loc, theta_covmat)
+    params = prior.sample(torch.Size([num_samples])).exp()
+    #################################
 
-def plot_seir(S_values, E_values, I_values, R_values, dt):
-    time_points = [i * dt for i in range(len(S_values))]
-    
-    plt.figure(figsize=(10, 6))
-    plt.plot(time_points, S_values, label="Susceptible (S)", color="blue")
-    plt.plot(time_points, E_values, label="Exposed (E)", color="orange")
-    plt.plot(time_points, I_values, label="Infected (I)", color="red")
-    plt.plot(time_points, R_values, label="Recovered (R)", color="green")
-    
-    plt.title("SEIR Model Simulation with Stochastic Elements")
-    plt.xlabel("Time (days)")
-    plt.ylabel("Population")
-    plt.legend()
-    plt.grid(True)
-    plt.show()
+    T0, T = 0.0, 100.0  # initial and final time
+    GRID = grid  # time-grid
+
+    population_size = 500.0
+    initial_exposed = 1.0  # initial number of exposed individuals
+    initial_infected = 2.0  # initial number of infected individuals
+
+    ## [S, E, I] (excluding R, as it will be calculated)
+    y0 = torch.tensor(
+        num_samples * [[population_size - initial_exposed - initial_infected, initial_exposed, initial_infected]],
+        device=device,
+    )  # starting point
+    ts = torch.linspace(T0, T, GRID, device=device)  # time grid
+
+    sde = SEIR_SDE(
+        population_size=torch.tensor(population_size, device=device), params=params,
+    ).to(device)
+
+    start_time = time.time()
+    ys = torchsde.sdeint(sde, y0, ts)  # solved sde
+    end_time = time.time()
+    print("Simulation Time: %s seconds" % (end_time - start_time))
+
+    save_dict = dict()
+    idx_good = torch.where(ys[:, :, 2].mean(0) >= 1)[0]  # Filter based on infected individuals (Index 2 for I)
+
+    save_dict["prior_samples"] = params[idx_good].cpu()
+    save_dict["ts"] = ts.cpu()
+    save_dict["dt"] = (ts[1] - ts[0]).cpu()  # delta-t (time grid)
+
+    # Save only I (infected) component at index 2
+    save_dict["ys"] = ys[:, idx_good, 2].cpu()  # Only infected individuals
+
+    if savegrad:
+        # central difference for gradient calculation
+        grads = (ys[2:, ...] - ys[:-2, ...]) / (2 * save_dict["dt"])
+        save_dict["grads"] = grads[:, idx_good, 2].cpu()  # Gradients only for infected compartment
+
+    # meta data
+    save_dict["N"] = population_size
+    save_dict["E0"] = initial_exposed
+    save_dict["I0"] = initial_infected
+    save_dict["num_samples"] = save_dict["prior_samples"].shape[0]
+
+    if save:
+        print("Saving data.", end=" ")
+        torch.save(save_dict, f"data/{filename}")
+
+    print("DONE.")
+    return save_dict
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="SEIR Model Simulation")
-    parser.add_argument("--beta", default=0.3, type=float, help="Transmission rate")
-    parser.add_argument("--sigma", default=0.1, type=float, help="Rate from E to I")
-    parser.add_argument("--gamma", default=0.1, type=float, help="Recovery rate")
-    parser.add_argument("--initial_values", nargs=4, type=int, default=[999, 0, 1, 0], help="Initial values for S, E, I, R")
-    parser.add_argument("--N", default=1000, type=int, help="Total population size")
-    parser.add_argument("--dt", default=1.0, type=float, help="Time step size in days")
-    parser.add_argument("--T", default=100.0, type=float, help="Total time of the simulation in days")
+    parser = argparse.ArgumentParser(description="Epidemic: solve SEIR equations")
+    parser.add_argument("--num-samples", default=1000, type=int)
+    parser.add_argument("--device", default="cpu", type=str)
+
+    if not os.path.exists("data"):
+        os.makedirs("data")
 
     args = parser.parse_args()
 
-    S_values, E_values, I_values, R_values = seir_simulation(
-        beta=args.beta,
-        sigma=args.sigma,
-        gamma=args.gamma,
-        initial_values=args.initial_values,
-        N=args.N,
-        dt=args.dt,
-        T=args.T
+    print("Generating initial training data...")
+    solve_seir_sdes(
+        num_samples=args.num_samples,
+        device=args.device,
+        grid=10000,
+        save=True,
+        savegrad=False,
     )
+    print("Generating initial test data...")
+    ####### generate a big test dataset
+    test_data = []
+    for i in range(3):
+        dict_i = solve_seir_sdes(
+            num_samples=args.num_samples,
+            device=args.device,
+            grid=10000,
+            save=False,
+            savegrad=False,
+        )
+        test_data.append(dict_i)
 
-    # Plot the results
-    plot_seir(S_values, E_values, I_values, R_values, dt=args.dt)
+    save_dict = {
+        "prior_samples": torch.cat([d["prior_samples"] for d in test_data]),
+        "ys": torch.cat([d["ys"] for d in test_data], dim=1),
+        "dt": test_data[0]["dt"],
+        "ts": test_data[0]["ts"],
+        "N": test_data[0]["N"],
+        "E0": test_data[0]["E0"],
+        "I0": test_data[0]["I0"],
+    }
+    save_dict["num_samples"] = save_dict["prior_samples"].shape[0]
+    torch.save(save_dict, "data/seir_sde_data_test.pt")
