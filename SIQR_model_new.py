@@ -1,10 +1,11 @@
 import os
 import torch
 import torch.nn as nn
-import pyro.optim
+import torch.optim as optim
 import time
-import matplotlib.pyplot as plt
 from tqdm import trange, tqdm
+import matplotlib.pyplot as plt
+
 
 # --- Encoder and Emitter Networks ---
 class EncoderNetwork(nn.Module):
@@ -12,8 +13,6 @@ class EncoderNetwork(nn.Module):
         super().__init__()
         self.network = nn.Sequential(
             nn.Linear(design_dim + observation_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),  # Added layer
             nn.ReLU(),
             nn.Linear(hidden_dim, encoding_dim)
         )
@@ -29,9 +28,7 @@ class EmitterNetwork(nn.Module):
         self.network = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),  # Added layer
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, output_dim)
+            nn.Linear(hidden_dim, output_dim)
         )
 
     def forward(self, r):
@@ -85,10 +82,13 @@ def load_data(file_path):
 
 
 # --- Training Loop ---
-def train_dad_model(model, prior_samples, observed_samples, epochs, scheduler, optimizer, use_noise=True):
+def train_dad_model(model, prior_samples, observed_samples, epochs, lr=1e-3, use_noise=True):
+    optimizer = optim.Adam(model.parameters(), lr=lr)
     loss_history = []
 
     print(f"Initial xi shape: {prior_samples.shape}, y shape: {observed_samples.shape}")
+
+    # Ensure observed_samples is 2D
     observed_samples = observed_samples.unsqueeze(-1) if observed_samples.ndim == 1 else observed_samples
 
     for epoch in trange(epochs, desc="Training Progress"):
@@ -111,14 +111,17 @@ def train_dad_model(model, prior_samples, observed_samples, epochs, scheduler, o
         loss = pce_loss(prior_samples, outputs)
         loss.backward()
         optimizer.step()
-        scheduler.step()  # Update the learning rate
         loss_history.append(loss.item())
 
-        # Extract the current learning rate from the optimizer
-        current_lr = optimizer.param_groups[0]['lr']
-
         if (epoch + 1) % 10 == 0:
-            print(f"Epoch [{epoch+1}/{epochs}], Loss: {loss.item():.4f}, LR: {current_lr:.6f}")
+            print(f"Epoch [{epoch+1}/{epochs}], Loss: {loss.item():.4f}")
+
+    # Plot the loss history
+    plt.plot(loss_history)
+    plt.xlabel("Epochs")
+    plt.ylabel("Loss")
+    plt.title("Training Loss Curve")
+    plt.show()
 
     return loss_history
 
@@ -128,6 +131,7 @@ def evaluate_model(model, prior_samples, observed_samples, strategy, n_rollout=5
     model.eval()
     information_gain = []
 
+    # Ensure observed_samples is 2D
     observed_samples = observed_samples.unsqueeze(-1) if observed_samples.ndim == 1 else observed_samples
 
     start_time = time.time()
@@ -143,6 +147,7 @@ def evaluate_model(model, prior_samples, observed_samples, strategy, n_rollout=5
             else:
                 raise ValueError(f"Invalid strategy: {strategy}")
 
+            # Calculate EIG using entropy approximation
             prior_entropy = -(prior_samples ** 2).mean()
             posterior_entropy = -((designs - observed_samples) ** 2).mean()
             ig = prior_entropy - posterior_entropy
@@ -159,35 +164,32 @@ def evaluate_model(model, prior_samples, observed_samples, strategy, n_rollout=5
 # --- Main Experiment ---
 def main():
     # Paths to the data
-    TRAIN_DATA_PATH = "data/seir_sde_data.pt"
-    TEST_DATA_PATH = "data/seir_sde_data_test.pt"
+    TRAIN_DATA_PATH = "data/siqr_sde_data.pt"
+    TEST_DATA_PATH = "data/siqr_sde_data_test.pt"
 
     # Load SEIR SDE data
     train_observed, train_prior_samples = load_data(TRAIN_DATA_PATH)
     test_observed, test_prior_samples = load_data(TEST_DATA_PATH)
 
+    # Ensure test_observed is 2D
     test_observed = test_observed.unsqueeze(-1) if test_observed.ndim == 1 else test_observed
 
     design_dim = train_prior_samples.size(-1)
     observation_dim = 1  # Only tracking the infected compartment (I)
-    hidden_dim = 512
-    encoding_dim = 256
-    epochs = 500
+    hidden_dim = 256
+    encoding_dim = 128
+    epochs = 300
     lr = 1e-3
-    gamma = 0.995  # Decay factor for ExponentialLR
     n_rollout = 5000
 
     encoder = EncoderNetwork(design_dim, observation_dim, hidden_dim, encoding_dim)
     emitter = EmitterNetwork(encoding_dim, hidden_dim, design_dim)
     model = SetEquivariantDesignNetwork(encoder, emitter, empty_value=torch.zeros(design_dim))
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.999), weight_decay=0)
-    scheduler = pyro.optim.ExponentialLR({"optimizer": optimizer, "gamma": gamma, "optim_args": {"lr": lr}})
-
     # Train DAD Model
     print("Training DAD Model...")
     start_train = time.time()
-    loss_history = train_dad_model(model, train_prior_samples, train_observed, epochs, scheduler, optimizer, use_noise=True)
+    loss_history = train_dad_model(model, train_prior_samples, train_observed, epochs, lr, use_noise=True)
     train_time = time.time() - start_train
     print(f"Training Time: {train_time:.2f} seconds")
 
