@@ -1,1 +1,1 @@
-Codes for enhancing epidemiological models using deep adaptive design.
+**Codes for Enhancing Epidemiological Models Using Deep Adaptive Design.**
