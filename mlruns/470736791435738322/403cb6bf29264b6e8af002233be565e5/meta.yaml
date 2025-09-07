@@ -1,0 +1,15 @@
+artifact_uri: file:///Users/gaoming/Documents/Research/Codes/epidemiological_model_dad/mlruns/470736791435738322/403cb6bf29264b6e8af002233be565e5/artifacts
+end_time: 1757274507233
+entry_point_name: ''
+experiment_id: '470736791435738322'
+lifecycle_stage: active
+run_id: 403cb6bf29264b6e8af002233be565e5
+run_name: brawny-hound-355
+run_uuid: 403cb6bf29264b6e8af002233be565e5
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1757274507206
+status: 3
+tags: []
+user_id: gaoming

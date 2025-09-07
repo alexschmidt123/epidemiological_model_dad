@@ -1,0 +1,15 @@
+artifact_uri: file:///Users/gaoming/Documents/Research/Codes/epidemiological_model_dad/mlruns/470736791435738322/1758ede7c4e14d9994fb463ff19d60eb/artifacts
+end_time: 1757274157693
+entry_point_name: ''
+experiment_id: '470736791435738322'
+lifecycle_stage: active
+run_id: 1758ede7c4e14d9994fb463ff19d60eb
+run_name: rebellious-quail-29
+run_uuid: 1758ede7c4e14d9994fb463ff19d60eb
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1757274157665
+status: 3
+tags: []
+user_id: gaoming

@@ -96,31 +96,48 @@ class SEIR_DAD_Model(nn.Module):
     def solve_seir_sde(self, params, design_time):
         """Solve SEIR SDE up to design_time and return infected count"""
         
+        # Handle scalar design_time by converting to tensor
+        if isinstance(design_time, torch.Tensor):
+            if design_time.dim() > 0:
+                design_time = design_time.item()  # Extract scalar from tensor
+        
+        # Ensure design_time is a positive float
+        design_time = float(max(design_time, 0.1))  # Minimum time of 0.1
+        
         # Initial conditions [S, E, I]
-        y0 = torch.tensor([[
+        batch_size = params.shape[0]
+        y0 = torch.tensor([
             self.N - self.E0 - self.I0, 
             self.E0, 
             self.I0
-        ]], device=params.device).expand(params.shape[0], -1)
+        ], device=params.device).unsqueeze(0).expand(batch_size, -1).clone()
         
         # Time points: from 0 to design_time
-        ts = torch.linspace(0, design_time, 50, device=params.device)
+        n_steps = min(50, max(10, int(design_time * 2)))  # Adaptive steps
+        ts = torch.linspace(0.0, design_time, n_steps, device=params.device)
         
         # Create SDE
-        sde = SEIR_SDE(params=params, population_size=self.N)
+        sde = SEIR_SDE(params=params, population_size=torch.tensor(self.N, device=params.device))
         
         # Solve SDE
         try:
             ys = torchsde.sdeint(sde, y0, ts)  # shape: [time_steps, batch, 3]
             
-            # Return infected count at final time
+            # Return infected count at final time (single value per batch)
             infected_final = ys[-1, :, 2]  # I compartment at final time
-            return infected_final.clamp(min=0)
+            infected_final = infected_final.clamp(min=0)
+            
+            # Ensure we return a single scalar per batch element
+            if infected_final.dim() > 1:
+                infected_final = infected_final.squeeze()
+            
+            return infected_final
             
         except Exception as e:
             # Fallback: return deterministic solution or prior
             print(f"SDE integration failed: {e}")
-            return torch.ones(params.shape[0], device=params.device) * self.I0
+            fallback = torch.ones(batch_size, device=params.device) * self.I0
+            return fallback.squeeze() if fallback.dim() > 1 and batch_size == 1 else fallback
 
     def model(self):
         """Pyro model for DAD framework"""
@@ -154,11 +171,17 @@ class SEIR_DAD_Model(nn.Module):
             
             # Observe with noise (Poisson or Negative Binomial)
             # Using Poisson for simplicity, but could use more complex observation model
+            # FIXED: Ensure single scalar observation
+            if infected_count.dim() > 0 and infected_count.numel() > 1:
+                obs_rate = infected_count[0].item()  # Take first element
+            else:
+                obs_rate = infected_count.item() if infected_count.numel() == 1 else float(infected_count)
+
             y = observation_sample(
                 f"y{t + 1}", 
-                dist.Poisson(infected_count + 1e-6)  # Small epsilon for numerical stability
+                dist.Poisson(torch.tensor(obs_rate + 1e-6))
             )
-            
+                        
             y_outcomes.append(y)
             xi_designs.append(xi)
             
@@ -176,61 +199,103 @@ class SEIR_DAD_Model(nn.Module):
         output = []
         with torch.no_grad():
             for i in range(n_trace):
-                trace = pyro.poutine.trace(model).get_trace()
-                
-                true_theta = trace.nodes["theta"]["value"]
-                run_xis = []
-                run_ys = []
-                
-                for t in range(self.T):
-                    xi = trace.nodes[f"xi{t + 1}"]["value"].item()
-                    run_xis.append(xi)
+                try:
+                    trace = pyro.poutine.trace(model).get_trace()
                     
-                    y = trace.nodes[f"y{t + 1}"]["value"].item()
-                    run_ys.append(y)
-                
-                run_dict = {
-                    "designs": run_xis,
-                    "observations": run_ys,
-                    "theta": true_theta.exp().cpu().numpy(),  # Convert back to original scale
-                    "run_id": i + 1
-                }
-                output.append(run_dict)
+                    true_theta = trace.nodes["theta"]["value"]
+                    run_xis = []
+                    run_ys = []
+                    
+                    for t in range(self.T):
+                        xi_node = trace.nodes.get(f"xi{t + 1}")
+                        y_node = trace.nodes.get(f"y{t + 1}")
+                        
+                        if xi_node is not None:
+                            xi_val = xi_node["value"]
+                            if isinstance(xi_val, torch.Tensor):
+                                if xi_val.dim() > 0:
+                                    xi_val = xi_val.item()
+                                else:
+                                    xi_val = float(xi_val)
+                            run_xis.append(xi_val)
+                        
+                        if y_node is not None:
+                            y_val = y_node["value"]
+                            if isinstance(y_val, torch.Tensor):
+                                if y_val.dim() > 0:
+                                    y_val = y_val.item()
+                                else:
+                                    y_val = float(y_val)
+                            run_ys.append(y_val)
+                    
+                    run_dict = {
+                        "designs": run_xis,
+                        "observations": run_ys,
+                        "theta": true_theta.exp().cpu().numpy() if isinstance(true_theta, torch.Tensor) else true_theta,
+                        "run_id": i + 1
+                    }
+                    output.append(run_dict)
+                    
+                except Exception as e:
+                    print(f"Evaluation error for trace {i}: {e}")
+                    continue
                 
         return output
 
 
+# Custom encoder that handles the xi, y input format correctly
+class SEIR_Encoder(nn.Module):
+    def __init__(self, hidden_dim, encoding_dim):
+        super().__init__()
+        self.encoding_dim = encoding_dim
+        self.net = nn.Sequential(
+            nn.Linear(2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, encoding_dim)
+        )
+        
+    def forward(self, xi, y, **kwargs):
+        # Convert everything to scalars
+        xi_val = xi.item() if hasattr(xi, 'item') else float(xi)
+        y_val = y.item() if hasattr(y, 'item') else float(y)
+        
+        # Create input tensor and get output
+        inputs = torch.tensor([[xi_val, y_val]], dtype=torch.float32)
+        output = self.net(inputs)
+        
+        # CRITICAL FIX: Return with shape [encoding_dim], not [1, encoding_dim]
+        return output.squeeze(0)  # Remove batch dimension
+# Custom emitter
+class SEIR_Emitter(nn.Module):
+    def __init__(self, encoding_dim, hidden_dim, output_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(encoding_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim)
+        )
+        
+    def forward(self, x):
+        return self.net(x)
+
+
 def create_seir_design_network(
-    design_dim=1,  # Time dimension
+    design_dim=1,
     hidden_dim=128,
     encoding_dim=16,
     num_layers=2
 ):
-    """Create design network for SEIR model"""
+    """Create design network for SEIR model - COMPLETELY FRESH VERSION"""
     
-    from neural.modules import Mlp
+    # Create networks
+    encoder = SEIR_Encoder(hidden_dim, encoding_dim)
+    emitter = SEIR_Emitter(encoding_dim, hidden_dim, design_dim)
     
-    # Encoder: takes (time_design, infected_count) pairs
-    encoder = Mlp(
-        input_dim=2,  # [time, infected_count]
-        hidden_dim=hidden_dim,
-        output_dim=encoding_dim,
-        n_hidden_layers=num_layers
-    )
-    
-    # Emitter: outputs next time design
-    emitter = Mlp(
-        input_dim=encoding_dim,
-        hidden_dim=hidden_dim,
-        output_dim=design_dim,
-        n_hidden_layers=num_layers
-    )
-    
-    # Create set-equivariant design network
+    # Create design network
     design_net = SetEquivariantDesignNetwork(
         encoder_network=encoder,
         emission_network=emitter,
-        empty_value=torch.ones(design_dim)  # Default first design
+        empty_value=torch.ones(design_dim)
     )
     
     return design_net
