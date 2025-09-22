@@ -1,0 +1,6 @@
+artifact_location: file:///Users/gaoming/Documents/Research/Codes/epidemiological_model_dad/mlruns/664457898308911862
+creation_time: 1758529213086
+experiment_id: '664457898308911862'
+last_update_time: 1758529213086
+lifecycle_stage: active
+name: seir_process
